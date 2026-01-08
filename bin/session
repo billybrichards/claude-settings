@@ -1,0 +1,425 @@
+#!/usr/bin/env bash
+#
+# Claude Session Manager
+# Tracks sessions, agents, and progress for Claude Code workflows
+# Sessions are automatically tied to: project + git branch + optional ID
+#
+
+set -e
+
+CLAUDE_DIR="$HOME/.claude"
+SESSIONS_FILE="$CLAUDE_DIR/sessions.md"
+
+# Get project name from directory
+PROJECT_NAME=$(basename "$PWD")
+
+# Get current git branch (empty if not in git repo)
+get_git_branch() {
+    git rev-parse --abbrev-ref HEAD 2>/dev/null || echo ""
+}
+
+GIT_BRANCH=$(get_git_branch)
+
+# Generate a unique hash for project + branch combination
+get_context_hash() {
+    echo -n "${PWD}:${GIT_BRANCH}" | md5sum | cut -c1-8
+}
+
+# Context-specific current session file (project + branch)
+CONTEXT_HASH=$(get_context_hash)
+CURRENT_SESSION="$CLAUDE_DIR/current-session-${CONTEXT_HASH}.json"
+
+# Build the full session context identifier
+get_context_id() {
+    if [[ -n "$GIT_BRANCH" ]]; then
+        echo "${PROJECT_NAME}/${GIT_BRANCH}"
+    else
+        echo "${PROJECT_NAME}"
+    fi
+}
+
+CONTEXT_ID=$(get_context_id)
+
+# Status emoji mappings
+declare -A STATUS_EMOJI=(
+    ["active"]="🟢"
+    ["paused"]="🟡"
+    ["blocked"]="🔴"
+    ["complete"]="⚪"
+    ["archived"]="📦"
+)
+
+# Initialize files if they don't exist
+init_files() {
+    if [[ ! -f "$SESSIONS_FILE" ]]; then
+        cat > "$SESSIONS_FILE" << 'EOF'
+# Claude Session Index
+
+| Context (Project/Branch) | Task ID | Status | Progress | Description | Started | Last Active | Agents |
+|--------------------------|---------|--------|----------|-------------|---------|-------------|--------|
+EOF
+    fi
+
+    if [[ ! -f "$CURRENT_SESSION" ]]; then
+        echo '{"id":"","status":"","progress":0,"description":"","agents":[],"context":"","project":"","branch":""}' > "$CURRENT_SESSION"
+    fi
+}
+
+# Generate progress bar (8 chars wide)
+progress_bar() {
+    local pct=$1
+    local filled=$((pct * 8 / 100))
+    local empty=$((8 - filled))
+    local bar=""
+
+    for ((i=0; i<filled; i++)); do bar+="█"; done
+    for ((i=0; i<empty; i++)); do bar+="░"; done
+
+    echo "${bar} ${pct}%"
+}
+
+# Get current session data
+get_current() {
+    if [[ -f "$CURRENT_SESSION" ]]; then
+        cat "$CURRENT_SESSION"
+    else
+        echo '{"id":"","status":"","progress":0,"description":"","agents":[]}'
+    fi
+}
+
+# Get current session ID
+get_id() {
+    jq -r '.id // ""' "$CURRENT_SESSION" 2>/dev/null || echo ""
+}
+
+# Get current status
+get_status() {
+    jq -r '.status // ""' "$CURRENT_SESSION" 2>/dev/null || echo ""
+}
+
+# Get current progress
+get_progress() {
+    jq -r '.progress // 0' "$CURRENT_SESSION" 2>/dev/null || echo "0"
+}
+
+# Update sessions.md with current session data
+update_sessions_md() {
+    local id=$(get_id)
+    local status=$(get_status)
+    local progress=$(get_progress)
+    local desc=$(jq -r '.description // ""' "$CURRENT_SESSION")
+    local agents=$(jq -r '.agents | length' "$CURRENT_SESSION")
+    local today=$(date +%Y-%m-%d)
+    local emoji="${STATUS_EMOJI[$status]:-🟢}"
+    local bar=$(progress_bar "$progress")
+
+    # Use context + task as unique key
+    local row_key="${CONTEXT_ID}:${id}"
+    local display_id="${id:-_default_}"
+
+    # Check if session exists in file (match by context + task)
+    if grep -q "| ${CONTEXT_ID} | ${display_id} |" "$SESSIONS_FILE" 2>/dev/null; then
+        # Update existing row
+        local temp_file=$(mktemp)
+        while IFS= read -r line; do
+            if [[ "$line" == "| ${CONTEXT_ID} | ${display_id} |"* ]]; then
+                # Extract started date from existing line
+                local started=$(echo "$line" | awk -F'|' '{print $7}' | xargs)
+                echo "| ${CONTEXT_ID} | ${display_id} | ${emoji} ${status^} | ${bar} | ${desc} | ${started} | ${today} | ${agents} |"
+            else
+                echo "$line"
+            fi
+        done < "$SESSIONS_FILE" > "$temp_file"
+        mv "$temp_file" "$SESSIONS_FILE"
+    else
+        # Add new row
+        echo "| ${CONTEXT_ID} | ${display_id} | ${emoji} ${status^} | ${bar} | ${desc} | ${today} | ${today} | ${agents} |" >> "$SESSIONS_FILE"
+    fi
+}
+
+# Set current session
+cmd_set() {
+    local task_id=""
+    local desc=""
+
+    # Smart argument parsing:
+    # - If 1 arg with spaces: treat as description
+    # - If 1 arg no spaces: treat as task_id
+    # - If 2 args: first is task_id, second is description
+    if [[ $# -eq 1 ]]; then
+        if [[ "$1" == *" "* ]]; then
+            desc="$1"
+        else
+            task_id="$1"
+        fi
+    elif [[ $# -ge 2 ]]; then
+        task_id="$1"
+        desc="$2"
+    fi
+
+    init_files
+
+    # Task ID is optional - context (project/branch) is automatic
+    local display_id="${task_id:-_default_}"
+
+    # Check if session exists in sessions.md to get existing data
+    local existing_status="active"
+    local existing_progress=0
+    local existing_desc="$desc"
+
+    if grep -q "| ${CONTEXT_ID} | ${display_id} |" "$SESSIONS_FILE" 2>/dev/null; then
+        local row=$(grep "| ${CONTEXT_ID} | ${display_id} |" "$SESSIONS_FILE")
+        existing_status=$(echo "$row" | awk -F'|' '{print $4}' | sed 's/[^a-zA-Z]//g' | tr '[:upper:]' '[:lower:]')
+        existing_progress=$(echo "$row" | awk -F'|' '{print $5}' | grep -oE '[0-9]+' | head -1)
+        if [[ -z "$desc" ]]; then
+            existing_desc=$(echo "$row" | awk -F'|' '{print $6}' | xargs)
+        fi
+    fi
+
+    # Update current session
+    jq -n \
+        --arg id "$task_id" \
+        --arg status "${existing_status:-active}" \
+        --argjson progress "${existing_progress:-0}" \
+        --arg desc "$existing_desc" \
+        --arg context "$CONTEXT_ID" \
+        --arg project "$PROJECT_NAME" \
+        --arg branch "$GIT_BRANCH" \
+        '{id: $id, status: $status, progress: $progress, description: $desc, agents: [], context: $context, project: $project, branch: $branch}' \
+        > "$CURRENT_SESSION"
+
+    update_sessions_md
+    echo "Session initialized for: $CONTEXT_ID"
+    [[ -n "$task_id" ]] && echo "Task ID: $task_id"
+    cmd_show
+}
+
+# Update session status
+cmd_status() {
+    local new_status="$1"
+    local valid_statuses="active paused blocked complete archived"
+
+    if [[ -z "$new_status" ]] || [[ ! " $valid_statuses " =~ " $new_status " ]]; then
+        echo "Usage: session status <active|paused|blocked|complete|archived>"
+        exit 1
+    fi
+
+    local current_status=$(get_status)
+    if [[ -z "$current_status" ]]; then
+        echo "No active session. Use 'session set' first."
+        exit 1
+    fi
+
+    local current=$(get_current)
+    echo "$current" | jq --arg s "$new_status" '.status = $s' > "$CURRENT_SESSION"
+
+    update_sessions_md
+    echo "Status updated to: ${STATUS_EMOJI[$new_status]} ${new_status^}"
+}
+
+# Update progress
+cmd_progress() {
+    local pct="$1"
+
+    if [[ -z "$pct" ]] || ! [[ "$pct" =~ ^[0-9]+$ ]] || [[ "$pct" -lt 0 ]] || [[ "$pct" -gt 100 ]]; then
+        echo "Usage: session progress <0-100>"
+        exit 1
+    fi
+
+    local current_status=$(get_status)
+    if [[ -z "$current_status" ]]; then
+        echo "No active session. Use 'session set' first."
+        exit 1
+    fi
+
+    local current=$(get_current)
+    echo "$current" | jq --argjson p "$pct" '.progress = $p' > "$CURRENT_SESSION"
+
+    update_sessions_md
+    echo "Progress updated: $(progress_bar "$pct")"
+}
+
+# Add or remove agent
+cmd_agent() {
+    local action="$1"
+    local agent_id="$2"
+
+    if [[ -z "$action" ]] || [[ -z "$agent_id" ]]; then
+        echo "Usage: session agent <add|remove> <agent-id>"
+        exit 1
+    fi
+
+    local current_status=$(get_status)
+    if [[ -z "$current_status" ]]; then
+        echo "No active session. Use 'session set' first."
+        exit 1
+    fi
+
+    local current=$(get_current)
+
+    case "$action" in
+        add)
+            echo "$current" | jq --arg a "$agent_id" '.agents += [$a] | .agents |= unique' > "$CURRENT_SESSION"
+            echo "Agent added: $agent_id"
+            ;;
+        remove)
+            echo "$current" | jq --arg a "$agent_id" '.agents -= [$a]' > "$CURRENT_SESSION"
+            echo "Agent removed: $agent_id"
+            ;;
+        *)
+            echo "Usage: session agent <add|remove> <agent-id>"
+            exit 1
+            ;;
+    esac
+
+    update_sessions_md
+}
+
+# Show current session
+cmd_show() {
+    local status=$(get_status)
+
+    if [[ -z "$status" ]]; then
+        echo "No active session for: $CONTEXT_ID"
+        echo ""
+        echo "Use 'session set [task-id] [description]' to start one."
+        echo "Example: session set 'Working on authentication'"
+        echo "         session set auth-impl 'Implementing OAuth flow'"
+        return
+    fi
+
+    local id=$(get_id)
+    local progress=$(get_progress)
+    local desc=$(jq -r '.description // ""' "$CURRENT_SESSION")
+    local agents=$(jq -r '.agents | join(", ")' "$CURRENT_SESSION")
+    local emoji="${STATUS_EMOJI[$status]:-🟢}"
+
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "  Context: $CONTEXT_ID"
+    [[ -n "$id" ]] && echo "  Task ID: $id"
+    echo "  Status:  ${emoji} ${status^}"
+    echo "  Progress: $(progress_bar "$progress")"
+    [[ -n "$desc" ]] && echo "  Desc:    $desc"
+    [[ -n "$agents" ]] && echo "  Agents:  $agents"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+}
+
+# List all sessions
+cmd_list() {
+    init_files
+
+    if [[ -f "$SESSIONS_FILE" ]]; then
+        cat "$SESSIONS_FILE"
+    else
+        echo "No sessions found."
+    fi
+}
+
+# Clear current session
+cmd_clear() {
+    echo '{"id":"","status":"","progress":0,"description":"","agents":[]}' > "$CURRENT_SESSION"
+    echo "Current session cleared."
+}
+
+# Output for statusline (compact format)
+cmd_statusline() {
+    local status=$(get_status)
+
+    if [[ -z "$status" ]]; then
+        # Show just context (project/branch) even without active session
+        if [[ -n "$GIT_BRANCH" ]]; then
+            echo "[${GIT_BRANCH}]"
+        else
+            echo "[${PROJECT_NAME}]"
+        fi
+        return
+    fi
+
+    local id=$(get_id)
+    local progress=$(get_progress)
+
+    # Compact progress bar (6 chars)
+    local filled=$((progress * 6 / 100))
+    local empty=$((6 - filled))
+    local bar=""
+    for ((i=0; i<filled; i++)); do bar+="█"; done
+    for ((i=0; i<empty; i++)); do bar+="░"; done
+
+    # Show branch (or project if no git) + optional task + progress
+    local display="${GIT_BRANCH:-$PROJECT_NAME}"
+    [[ -n "$id" ]] && display="${display}:${id}"
+
+    echo "[${display} ${bar} ${progress}%]"
+}
+
+# Main command router
+main() {
+    init_files
+
+    case "${1:-}" in
+        set)
+            shift
+            cmd_set "$@"
+            ;;
+        status)
+            shift
+            cmd_status "$@"
+            ;;
+        progress)
+            shift
+            cmd_progress "$@"
+            ;;
+        agent)
+            shift
+            cmd_agent "$@"
+            ;;
+        show)
+            cmd_show
+            ;;
+        list)
+            cmd_list
+            ;;
+        clear)
+            cmd_clear
+            ;;
+        statusline)
+            cmd_statusline
+            ;;
+        help|--help|-h)
+            echo "Claude Session Manager"
+            echo ""
+            echo "Sessions are automatically scoped to: project + git branch"
+            echo "Current context: $CONTEXT_ID"
+            echo ""
+            echo "Usage: session <command> [args]"
+            echo ""
+            echo "Commands:"
+            echo "  set [task-id] [desc]  Initialize session (task-id optional)"
+            echo "  status <state>        Update status (active|paused|blocked|complete|archived)"
+            echo "  progress <0-100>      Update progress percentage"
+            echo "  agent add <id>        Add agent to current session"
+            echo "  agent remove <id>     Remove agent from current session"
+            echo "  show                  Show current session details"
+            echo "  list                  Show all sessions (markdown table)"
+            echo "  clear                 Clear current session"
+            echo "  statusline            Output compact format for statusline"
+            echo "  help                  Show this help"
+            echo ""
+            echo "Examples:"
+            echo "  session set 'Working on login feature'"
+            echo "  session set auth-impl 'OAuth implementation'"
+            echo "  session progress 50"
+            echo "  session status paused"
+            ;;
+        "")
+            cmd_show
+            ;;
+        *)
+            echo "Unknown command: $1"
+            echo "Use 'session help' for usage"
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
