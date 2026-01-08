@@ -1,0 +1,25 @@
+{
+  "description": "Auto-update session status every 10 minutes with Haiku summaries",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks-handlers/session-start.sh"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks-handlers/check-update.sh"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,5 @@
+{
+  "name": "session-update",
+  "version": "1.0.0",
+  "description": "Auto-update session status with Haiku-generated summaries every 10 minutes"
+}
